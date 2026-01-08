@@ -7,6 +7,8 @@ from keras import layers
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
+import pandas as pd
+import json
 
 path = os.getcwd()
 
@@ -28,6 +30,7 @@ class GestureConv1DTrainer:
         self.feature_size = None
         self.model = None
         self.label_encoder = LabelEncoder()
+        self.training_metrics = {}
         
     def load_dataset(self, val_split=0.15, test_split=0.15):
         """Load and split sequence dataset"""
@@ -153,30 +156,102 @@ class GestureConv1DTrainer:
         pred_classes = np.argmax(predictions, axis=1)
         true_classes = np.argmax(self.y_test, axis=1)
         
+        per_class_metrics = {}
         print("\nPer-class accuracy:")
         for cls in range(self.num_classes):
             mask = true_classes == cls
             if np.sum(mask) > 0:
                 cls_accuracy = np.mean(pred_classes[mask] == true_classes[mask])
-                cls_name = self.label_encoder.classes_[cls]
-                print(f"  Class {cls_name}: {cls_accuracy:.4f} ({np.sum(mask)} samples)")
+                cls_name = str(self.label_encoder.classes_[cls])
+                num_samples = int(np.sum(mask))
+                print(f"  Class {cls_name}: {cls_accuracy:.4f} ({num_samples} samples)")
+                per_class_metrics[cls_name] = {
+                    'accuracy': float(cls_accuracy),
+                    'num_samples': num_samples
+                }
+        
+        # Store test metrics
+        self.training_metrics['test'] = {
+            'loss': float(test_loss),
+            'accuracy': float(test_accuracy),
+            'per_class': per_class_metrics
+        }
         
         return test_loss, test_accuracy
     
-    def plot_training_history(self, history, save_path=None):
-        """Plot training history"""
+    def save_training_metrics(self, history):
+        """Save all training metrics to a single JSON file"""
+        print("\nSaving training metrics...")
+        
+        # Build complete metrics dictionary
+        all_metrics = {
+            'model_config': {
+                'num_classes': int(self.num_classes),
+                'sequence_length': int(self.sequence_length),
+                'feature_size': int(self.feature_size),
+                'class_names': self.label_encoder.classes_.tolist(),
+                'model_type': 'Conv1D'
+            },
+            'epoch_metrics': {
+                'epoch': list(range(1, len(history.history['loss']) + 1)),
+                'train_loss': [float(x) for x in history.history['loss']],
+                'train_accuracy': [float(x) for x in history.history['accuracy']],
+                'val_loss': [float(x) for x in history.history['val_loss']],
+                'val_accuracy': [float(x) for x in history.history['val_accuracy']]
+            },
+            'summary': {
+                'epochs_completed': len(history.history['loss']),
+                'final_train_loss': float(history.history['loss'][-1]),
+                'final_train_accuracy': float(history.history['accuracy'][-1]),
+                'final_val_loss': float(history.history['val_loss'][-1]),
+                'final_val_accuracy': float(history.history['val_accuracy'][-1]),
+                'best_val_accuracy': float(max(history.history['val_accuracy'])),
+                'best_val_loss': float(min(history.history['val_loss']))
+            }
+        }
+        
+        # Add test metrics if available
+        if hasattr(self, 'training_metrics') and 'test' in self.training_metrics:
+            all_metrics['test_metrics'] = self.training_metrics['test']
+        
+        # Save to single JSON file
+        metrics_path = os.path.join(self.output_dir, 'training_metrics.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+        print(f"All training metrics saved to {metrics_path}")
+    
+    def plot_training_history(self, history=None, json_path=None, save_path=None):
+        """Plot training history from history object or JSON file"""
+        if json_path:
+            # Load from JSON
+            print(f"Loading metrics from {json_path}")
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            history_dict = {
+                'accuracy': data['epoch_metrics']['train_accuracy'],
+                'val_accuracy': data['epoch_metrics']['val_accuracy'],
+                'loss': data['epoch_metrics']['train_loss'],
+                'val_loss': data['epoch_metrics']['val_loss']
+            }
+        elif history:
+            # Use history object
+            history_dict = history.history
+        else:
+            print("Error: Either history object or json_path must be provided")
+            return
+        
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
         
-        ax1.plot(history.history['accuracy'], label='Train', linewidth=2)
-        ax1.plot(history.history['val_accuracy'], label='Validation', linewidth=2)
+        ax1.plot(history_dict['accuracy'], label='Train', linewidth=2)
+        ax1.plot(history_dict['val_accuracy'], label='Validation', linewidth=2)
         ax1.set_xlabel('Epoch', fontsize=12)
         ax1.set_ylabel('Accuracy', fontsize=12)
         ax1.set_title('Model Accuracy', fontsize=14, fontweight='bold')
         ax1.legend(fontsize=11)
         ax1.grid(True, alpha=0.3)
         
-        ax2.plot(history.history['loss'], label='Train', linewidth=2)
-        ax2.plot(history.history['val_loss'], label='Validation', linewidth=2)
+        ax2.plot(history_dict['loss'], label='Train', linewidth=2)
+        ax2.plot(history_dict['val_loss'], label='Validation', linewidth=2)
         ax2.set_xlabel('Epoch', fontsize=12)
         ax2.set_ylabel('Loss', fontsize=12)
         ax2.set_title('Model Loss', fontsize=14, fontweight='bold')
@@ -286,13 +361,14 @@ class GestureConv1DTrainer:
 
 
 if __name__ == "__main__":
-    dataset_path = path + "/gesture_dataset_seq.h5"
-    output_dir = path + "/trained_models"
+    dataset_path = path + "/datasets/gesture_dataset_seq_diverse.h5"
+    # dataset_path = path + "/datasets/gesture_dataset_seq_enhanced.h5"
+    output_dir = path + "/trained_models1"
     
-    epochs = 100
+    epochs = 200
     batch_size = 32
     learning_rate = 0.001
-    conv_filters = [32, 64, 64]
+    conv_filters = [32, 64, 128]
     dense_units = [64, 32]
     dropout = 0.3
     quantize = True
@@ -304,6 +380,10 @@ if __name__ == "__main__":
     history = trainer.train(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
     trainer.evaluate()
     
+    # Save all metrics to CSV files
+    trainer.save_training_metrics(history)
+    
+    # Plot from history object
     plot_path = os.path.join(output_dir, 'conv1d_training_history.png')
     trainer.plot_training_history(history, save_path=plot_path)
     

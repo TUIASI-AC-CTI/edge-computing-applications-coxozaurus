@@ -1,6 +1,6 @@
 # Copyright 2025 NXP
 # SPDX-License-Identifier: Apache-2.0
-"""Auxiliar functions for displaying info and drawing figures on frame for sequential gestures."""
+"""Auxiliar functions for displaying info and drawing figures on frame for continuous sequential gestures."""
 import cv2
 import numpy as np
 
@@ -16,6 +16,7 @@ GREEN = (0, 202, 105)
 ORANGE = (0, 181, 249)
 BLUE = (224, 175, 14)
 RED = (0, 0, 255)
+YELLOW = (0, 255, 255)
 
 
 def draw_landmarks(landmarks, frame):
@@ -99,93 +100,115 @@ def hide_hand(hand_bbox, frame):
     cv2.drawContours(frame, [box], 0, GREEN, cv2.FILLED)
 
 
-def draw_overlay(frame, status, prediction_result, has_movement, last_prediction, 
-                 gesture_names, sequence_length, reset_cooldown_duration):
-    """Draw compact overlay information at bottom of frame"""
-    h, w = frame.shape[:2]
-    overlay_height = 60
+def draw_overlay_continuous(frame, status, is_processing, processing_elapsed, 
+                            prediction_result, gesture_names, processing_display_duration):
+    """
+    Draw overlay information for continuous recognition mode
     
+    Args:
+        frame: Video frame to draw on
+        status: Buffer status dictionary
+        is_processing: Whether currently in processing/display mode
+        processing_elapsed: Time elapsed since processing started
+        prediction_result: Classification result dictionary
+        gesture_names: Dictionary mapping class indices to gesture names
+        processing_display_duration: How long to display results
+    """
+    h, w = frame.shape[:2]
+    overlay_height = 80
+    
+    # Create semi-transparent overlay
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h - overlay_height), (w, h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
-    bar_width = 200
-    bar_height = 15
-    bar_x = 5
+    # Progress bar
+    bar_width = 250
+    bar_height = 20
+    bar_x = 20
     bar_y = h - overlay_height + 15
     
+    # Draw background
     cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
     
-    if status['in_reset_cooldown']:
-        progress = 1.0 - (status['reset_cooldown_remaining'] / reset_cooldown_duration)
+    if is_processing:
+        # Show processing countdown
+        progress = min(1.0, processing_elapsed / processing_display_duration)
         fill_width = int(bar_width * progress)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), (0, 165, 255), -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), ORANGE, -1)
     else:
-        progress = status['frame_count'] / sequence_length
+        # Show buffer fill progress
+        progress = min(1.0, status['frame_count'] / status['max_frames'])
         fill_width = int(bar_width * progress)
         
-        if status['is_ready'] and status['has_significant_movement']:
-            color = (0, 255, 0)  # Green
-        elif status['is_ready']:
-            color = (0, 165, 255)  # Orange
+        if status['is_ready']:
+            color = GREEN  # Green when ready
         else:
-            color = (100, 100, 100)  # Gray
+            color = (100, 100, 100)  # Gray when collecting
         
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), color, -1)
     
+    # Draw border
     cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), 2)
     
-    buffer_text_y = bar_y + bar_height + 18
-    buffer_text = f"{status['frame_count']}/{sequence_length}"
+    # Buffer status text
+    buffer_text_y = bar_y + bar_height + 20
+    buffer_text = f"Buffer: {status['frame_count']}/{status['max_frames']}"
+    if status['null_count'] > 0:
+        buffer_text += f" (Nulls: {status['null_count']})"
     cv2.putText(frame, buffer_text, (bar_x, buffer_text_y), 
                FONT, 0.5, (200, 200, 200), 1)
     
-    text_x = bar_x + bar_width + 20
+    # Prediction/status text
+    text_x = bar_x + bar_width + 30
     text_y_line1 = h - overlay_height + 25
-    text_y_line2 = h - overlay_height + 45
+    text_y_line2 = h - overlay_height + 50
+    text_y_line3 = h - overlay_height + 70
     
-    if status['in_reset_cooldown']:
-        if last_prediction is not None:
-            if not last_prediction['has_movement']:
-                cv2.putText(frame, "Last: NO MOVEMENT DETECTED", (text_x, text_y_line1), 
-                           FONT, 0.55, ORANGE, 2)
-            elif last_prediction['is_unknown']:
-                result_text = f"Last: UNKNOWN (C:{last_prediction['max_confidence']:.0%} E:{last_prediction['entropy']:.2f})"
-                cv2.putText(frame, result_text, (text_x, text_y_line1), 
-                           FONT, 0.55, RED, 2)
-            else:
-                label = gesture_names.get(last_prediction['predicted_class'], 
-                                         f"Class {last_prediction['predicted_class']}")
-                result_text = f"Last: {label} (C:{last_prediction['max_confidence']:.0%} E:{last_prediction['entropy']:.2f})"
-                cv2.putText(frame, result_text, (text_x, text_y_line1), 
-                           FONT, 0.55, GREEN, 2)
+    if is_processing and prediction_result:
+        remaining = max(0, processing_display_duration - processing_elapsed)
         
-        cooldown_text = f"COOLDOWN: {status['reset_cooldown_remaining']:.1f}s - {status['reset_reason']}"
-        cv2.putText(frame, cooldown_text, (text_x, text_y_line2), 
-                   FONT, 0.55, ORANGE, 2)
-    elif prediction_result is not None and status['is_ready']:
-        if not has_movement:
-            cv2.putText(frame, "NO MOVEMENT DETECTED", (text_x, text_y_line1), 
-                       FONT, 0.6, ORANGE, 2)
-        elif prediction_result['is_unknown']:
-            result_text = f"UNKNOWN GESTURE (C:{prediction_result['max_confidence']:.0%} E:{prediction_result['entropy']:.2f})"
+        if prediction_result['is_unknown']:
+            # Display raw class for unknown predictions
+            raw_label = gesture_names.get(prediction_result['predicted_class'], 
+                                          f"Class {prediction_result['predicted_class']}")
+            result_text = f"UNKNOWN ({raw_label})"
             cv2.putText(frame, result_text, (text_x, text_y_line1), 
                        FONT, 0.6, RED, 2)
+            
+            conf_text = f"C:{prediction_result['max_confidence']:.0%} | E:{prediction_result['entropy']:.2f}"
+            cv2.putText(frame, conf_text, (text_x, text_y_line2), 
+                       FONT, 0.45, (200, 200, 200), 1)
         else:
             label = gesture_names.get(prediction_result['predicted_class'], 
                                      f"Class {prediction_result['predicted_class']}")
-            conf_text = f"{label} (C:{prediction_result['max_confidence']:.0%} E:{prediction_result['entropy']:.2f})"
-            cv2.putText(frame, conf_text, (text_x, text_y_line1), 
-                       FONT, 0.6, GREEN, 2)
+            result_text = f"{label}"
+            cv2.putText(frame, result_text, (text_x, text_y_line1), 
+                       FONT, 0.7, GREEN, 2)
+            
+            conf_text = f"Confidence: {prediction_result['max_confidence']:.0%} | Entropy: {prediction_result['entropy']:.2f}"
+            cv2.putText(frame, conf_text, (text_x, text_y_line2), 
+                       FONT, 0.45, (200, 200, 200), 1)
+        
+        if prediction_result.get('voting_results'):
+            voting_text = f"Windows: {prediction_result['num_valid']}/{prediction_result['num_windows']} valid"
+            cv2.putText(frame, voting_text, (text_x, text_y_line3), 
+                       FONT, 0.45, (200, 200, 200), 1)
+            
     elif status['consecutive_nulls'] > 0:
         warning_text = f"Missing detection ({status['consecutive_nulls']}/2)"
         cv2.putText(frame, warning_text, (text_x, text_y_line1), 
                    FONT, 0.55, ORANGE, 2)
+    elif status['is_ready']:
+        ready_text = "READY - Collecting data..."
+        cv2.putText(frame, ready_text, (text_x, text_y_line1), 
+                   FONT, 0.6, GREEN, 2)
     else:
-        collecting_text = "Collecting frames..."
+        collecting_text = f"Collecting... ({status['frame_count']}/{status['min_frames']} minimum)"
         cv2.putText(frame, collecting_text, (text_x, text_y_line1), 
                    FONT, 0.55, (200, 200, 200), 1)
-        
+
+
 def draw_fps(fps, frame):
     """Draw FPS with color coding based on performance."""
     fps_text = f"FPS: {fps:.1f}"
@@ -194,7 +217,7 @@ def draw_fps(fps, frame):
     if fps < 10:
         color = RED  # Red for less than 10 FPS
     elif fps < 20:
-        color = (0, 255, 255)  # Yellow for 10-20 FPS
+        color = YELLOW  # Yellow for 10-20 FPS
     else:
         color = GREEN  # Green for 20+ FPS
     

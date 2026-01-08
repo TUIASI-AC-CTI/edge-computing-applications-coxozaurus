@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2025 NXP
 # SPDX-License-Identifier: Apache-2.0
-"""i.MX Sequential Gesture Recognition"""
+"""i.MX Continuous Sequential Gesture Recognition with Sliding Windows"""
 import os
 import sys
 import time
@@ -18,9 +18,13 @@ from app_utils import drawkit_seq
 if os.path.isdir("/opt/gopoint-apps/scripts/machine_learning/imx_gesture_recognition"):
     sys.path.append("/opt/gopoint-apps/scripts/machine_learning/imx_gesture_recognition")
 
-SEQUENCE_LENGTH = 10
-MOVEMENT_THRESHOLD = 1.0
-RESET_COOLDOWN_DURATION = 4.0
+# Continuous recognition parameters
+MIN_FRAMES = 10  # Minimum frames before processing
+MAX_FRAMES = 20  # Maximum frames to capture
+SEQUENCE_LENGTH = 10  # Size of each sliding window
+MAX_SLIDING_WINDOWS = 7  # Maximum number of sliding windows to analyze
+
+PROCESSING_DISPLAY_DURATION = 4.0  # Duration to display results after processing
 
 GESTURE_NAMES = {
     0: "Swipe Up",
@@ -30,12 +34,13 @@ GESTURE_NAMES = {
     4: "Zoom In",
     5: "Zoom Out",
     6: "Rotate Clockwise",
-    7: "Rotate Counter Clockwise"
+    7: "Rotate Counter Clockwise",
+    8: "Unknown"
 }
 
 
 def run(stream, args):
-    """Run Sequential Hand Gesture Recognition task"""
+    """Run Continuous Sequential Hand Gesture Recognition task"""
     cap = cv2.VideoCapture(stream)
     if not cap.isOpened():
         raise RuntimeError(f"Error opening video stream or file: {stream}")
@@ -48,30 +53,34 @@ def run(stream, args):
         num_hands=args.num_hands,
     )
 
-    classifier = gesture_classifier_seq.Classifier(model=args.classification_model)
-    
-    # Initialize sequence buffer
-    sequence_buffer = gesture_classifier_seq.SequenceBuffer(
-        sequence_length=SEQUENCE_LENGTH,
-        feature_size=63,
-        movement_threshold=MOVEMENT_THRESHOLD
+    classifier = gesture_classifier_seq.Classifier(
+        model=args.classification_model,
+        external_delegate=args.external_delegate_path
     )
     
-    cv2.namedWindow("i.MX Sequential Gesture Recognition", cv2.WND_PROP_FULLSCREEN)
+    # Initialize sequence buffer for continuous recognition
+    sequence_buffer = gesture_classifier_seq.SequenceBuffer(
+        min_frames=MIN_FRAMES,
+        max_frames=MAX_FRAMES,
+        sequence_length=SEQUENCE_LENGTH,
+        feature_size=63
+    )
     
-    in_cooldown = False
-    cooldown_frames = 0
-    cooldown_duration = 5
+    cv2.namedWindow("i.MX Continuous Sequential Gesture Recognition", cv2.WND_PROP_FULLSCREEN)
+    
+    # Processing state
+    is_processing = False
+    processing_start_time = None
     last_prediction_result = None
-    
-    # Warm-up: wait for stable hand detection before collecting
-    warmup_frames = 0
-    warmup_required = 3  # Require 3 consecutive detections before starting to collect
     
     # FPS tracking
     fps_start_time = time.time()
     fps_frame_count = 0
     current_fps = 0.0
+
+    logging.info("Starting continuous gesture recognition with sliding windows")
+    logging.info(f"Min frames: {MIN_FRAMES}, Max frames: {MAX_FRAMES}")
+    logging.info(f"Sequence length: {SEQUENCE_LENGTH}, Max windows: {MAX_SLIDING_WINDOWS}")
 
     while True:
         ret, frame = cap.read()
@@ -79,8 +88,6 @@ def run(stream, args):
             break
 
         start_time = time.time()
-        current_prediction = None
-        has_movement = True
         
         # Calculate FPS
         fps_frame_count += 1
@@ -90,15 +97,20 @@ def run(stream, args):
             fps_frame_count = 0
             fps_start_time = time.time()
         
-        if in_cooldown:
-            cooldown_frames -= 1
-            if cooldown_frames <= 0:
-                sequence_buffer.reset("Prediction completed")
-                in_cooldown = False
+        # Check if we're in processing/display mode
+        processing_elapsed = 0
+        if is_processing:
+            processing_elapsed = time.time() - processing_start_time
+            if processing_elapsed >= PROCESSING_DISPLAY_DURATION:
+                # Processing display period is over, reset buffer and resume
+                sequence_buffer.reset("Processing complete")
+                is_processing = False
+                processing_start_time = None
+                last_prediction_result = None
+                logging.debug("Processing complete, resuming capture")
         
-        status = sequence_buffer.get_status()
-        
-        if not in_cooldown and not status['in_reset_cooldown']:
+        # Continue capturing frames if not processing
+        if not is_processing:
             detections = tracker(frame)
             
             if detections:
@@ -107,50 +119,80 @@ def run(stream, args):
                     drawkit_seq.draw_landmarks(landmarks, frame)
                     drawkit_seq.draw_handbbox(hand_bbox, frame)
                     
-                    # Warm-up: only start collecting after stable detections
-                    if warmup_frames < warmup_required:
-                        warmup_frames += 1
-                    else:
-                        sequence_buffer.add_frame(landmarks)
+                    sequence_buffer.add_frame(landmarks)
             else:
-                # Reset warm-up counter if hand is lost
-                warmup_frames = 0
-                sequence_buffer.add_null_frame()
+                result = sequence_buffer.add_null_frame()
+                
+                # Check if hand was lost and we should process
+                if result == 'process':
+                    logging.debug("Hand lost, triggering processing")
+                    # Hand lost after capturing sufficient frames
+                    # Get sliding windows (this will automatically clean null frames)
+                    windows = sequence_buffer.get_sliding_windows(MAX_SLIDING_WINDOWS)
+                    
+                    if windows:
+                        logging.info(f"Processing {len(windows)} sliding windows")
+                        # Perform classification with majority voting
+                        prediction_result = classifier.classify_with_majority_voting(windows)
+                        
+                        if prediction_result:
+                            last_prediction_result = prediction_result
+                            is_processing = True
+                            processing_start_time = time.time()
+                            
+                            # Log the result
+                            if prediction_result['is_unknown']:
+                                logging.info(f"Prediction: UNKNOWN (raw class: {prediction_result['predicted_class']})")
+                            else:
+                                gesture_name = GESTURE_NAMES.get(prediction_result['predicted_class'], 
+                                                                f"Class {prediction_result['predicted_class']}")
+                                logging.info(f"Prediction: {gesture_name} "
+                                           f"(confidence: {prediction_result['max_confidence']:.2%}, "
+                                           f"entropy: {prediction_result['entropy']:.2f}, "
+                                           f"windows: {prediction_result['num_valid']}/{prediction_result['num_windows']})")
+                    else:
+                        # No valid windows after cleaning, just reset
+                        logging.debug("Insufficient valid frames after cleaning, resetting")
+                        sequence_buffer.reset("Insufficient valid frames")
             
             status = sequence_buffer.get_status()
             
-            if status['is_ready'] and not in_cooldown and not status['in_reset_cooldown']:
-                has_movement = status['has_significant_movement']
-                sequence = sequence_buffer.get_sequence()
+            # Also process if we reach MAX_FRAMES (to prevent indefinite capture)
+            if status['frame_count'] >= MAX_FRAMES and not is_processing:
+                logging.debug(f"Reached MAX_FRAMES ({MAX_FRAMES}), triggering processing")
+                windows = sequence_buffer.get_sliding_windows(MAX_SLIDING_WINDOWS)
                 
-                if sequence is not None:
-                    current_prediction = classifier(sequence)
+                if windows:
+                    logging.info(f"Processing {len(windows)} sliding windows (max frames reached)")
+                    prediction_result = classifier.classify_with_majority_voting(windows)
                     
-                    last_prediction_result = {
-                        'predicted_class': current_prediction['predicted_class'],
-                        'max_confidence': current_prediction['max_confidence'],
-                        'entropy': current_prediction['entropy'],
-                        'is_unknown': current_prediction['is_unknown'],
-                        'has_movement': has_movement
-                    }
-                    
-                    # Reset buffer immediately before starting cooldown
-                    sequence_buffer.reset("Prediction completed")
-                    warmup_frames = 0  # Reset warm-up counter
-                    in_cooldown = True
-                    cooldown_frames = cooldown_duration
+                    if prediction_result:
+                        last_prediction_result = prediction_result
+                        is_processing = True
+                        processing_start_time = time.time()
+                        
+                        # Log the result
+                        if prediction_result['is_unknown']:
+                            logging.info(f"Prediction: UNKNOWN (raw class: {prediction_result['predicted_class']})")
+                        else:
+                            gesture_name = GESTURE_NAMES.get(prediction_result['predicted_class'], 
+                                                            f"Class {prediction_result['predicted_class']}")
+                            logging.info(f"Prediction: {gesture_name} "
+                                       f"(confidence: {prediction_result['max_confidence']:.2%}, "
+                                       f"entropy: {prediction_result['entropy']:.2f}, "
+                                       f"windows: {prediction_result['num_valid']}/{prediction_result['num_windows']})")
         
-        drawkit_seq.draw_overlay(frame, status, current_prediction, has_movement, 
-                                 last_prediction_result, GESTURE_NAMES, 
-                                 SEQUENCE_LENGTH, RESET_COOLDOWN_DURATION)
+        status = sequence_buffer.get_status()
+        drawkit_seq.draw_overlay_continuous(
+            frame, status, is_processing, processing_elapsed,
+            last_prediction_result, GESTURE_NAMES, PROCESSING_DISPLAY_DURATION
+        )
         
         # Draw FPS on frame
         drawkit_seq.draw_fps(current_fps, frame)
 
-        cv2.imshow("i.MX Sequential Gesture Recognition", frame)
+        cv2.imshow("i.MX Continuous Sequential Gesture Recognition", frame)
         
-        # Explicit 10ms delay between frames
-        # time.sleep(0.01)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
@@ -160,13 +202,13 @@ def run(stream, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="i.MX Sequential Gesture Recognition showcases the Machine "
+        description="i.MX Continuous Sequential Gesture Recognition showcases the Machine "
         "Learning (ML) capabilities of the i.MX SoCs (i.MX 93 and i.MX 8M Plus) "
         "using the available Neural Processing Unit (NPU) to accelerate two "
-        "Deep Learning vision-based models. Together, these models detect up to "
-        "two hands present in the scene and predict 21 3D-keypoints that are used "
-        "to recognize dynamic hand gestures using sequences of landmarks with a "
-        "1D Convolutional Neural Network."
+        "Deep Learning vision-based models. This continuous mode uses sliding windows "
+        "with majority voting for robust gesture recognition. The system captures frames "
+        "continuously until hand is lost or maximum buffer is reached, then processes "
+        "multiple overlapping sequences to make a final prediction."
     )
 
     parser.add_argument(
@@ -194,7 +236,7 @@ if __name__ == "__main__":
         "--logging_level",
         metavar="logging level",
         type=int,
-        default=logging.WARNING,
+        default=logging.INFO,
         help="Logging level priority.",
     )
 
@@ -267,11 +309,16 @@ if __name__ == "__main__":
     logging.basicConfig(level=args.logging_level, format="%(levelname)s: %(message)s")
     logger = logging.getLogger()
 
+    logging.info("=== Continuous Sequential Gesture Recognition Configuration ===")
     logging.info("Source: %s", source)
     logging.info("Palm detection: %s", args.palm_model)
     logging.info("Hand landmark: %s", args.hand_landmark_model)
     logging.info("Classification model: %s", args.classification_model)
     logging.info("External delegate: %s", args.external_delegate_path)
     logging.info("Number of hands: %d", args.num_hands)
+    logging.info("Min frames: %d, Max frames: %d", MIN_FRAMES, MAX_FRAMES)
+    logging.info("Sequence length: %d, Max windows: %d", SEQUENCE_LENGTH, MAX_SLIDING_WINDOWS)
+    logging.info("Processing display duration: %.1fs", PROCESSING_DISPLAY_DURATION)
+    logging.info("===============================================================")
 
     run(source, args)
